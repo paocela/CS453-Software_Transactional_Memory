@@ -23,9 +23,9 @@
 
 // Compile-time configuration
 // #define USE_MM_PAUSE
-// #define USE_PTHREAD_LOCK
+#define USE_PTHREAD_LOCK
 // #define USE_TICKET_LOCK
-#define USE_RW_LOCK
+// #define USE_RW_LOCK
 
 // Requested features
 #define _GNU_SOURCE
@@ -360,20 +360,34 @@ struct region {
 };
 
 shared_t tm_create(size_t size, size_t align) {
+    // init shared memory region struct
     struct region* region = (struct region*) malloc(sizeof(struct region));
     if (unlikely(!region)) {
         return invalid_shared;
     }
+
+    /**
+     * calculate alignment (can be either minimum size (void*) or requested size (align))
+     * alignment definition --> see notes (paocela)
+    **/
     size_t align_alloc = align < sizeof(void*) ? sizeof(void*) : align; // Also satisfy alignment requirement of 'struct link'
+    
+    /**
+     * allocates size bytes and places the address of the first segment of the allocated memory in *memptr.
+     * the address of the allocated memory will be a multiple of align_alloc, which must be a power of two and a multiple of sizeof(void *)
+    **/
     if (unlikely(posix_memalign(&(region->start), align_alloc, size) != 0)) {
         free(region);
         return invalid_shared;
     }
+
+    // init global lock
     if (unlikely(!lock_init(&(region->lock)))) {
         free(region->start);
         free(region);
         return invalid_shared;
     }
+    
     memset(region->start, 0, size);
     link_reset(&(region->allocs));
     region->size        = size;
