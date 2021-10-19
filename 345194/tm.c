@@ -34,9 +34,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
 
 // Internal headers
 #include <tm.h>
+
+// Global constants
+#define SEGMENT_SHIFT 24
 
 // -------------------------------------------------------------------------- //
 
@@ -222,16 +227,23 @@ bool segment_init(segment_t *segment, size_t size, size_t align_alloc)
     segment->num_words = size / (align_alloc * 2); // each word is duplicated
     segment->word_size = align_alloc;
 
-    // init words in segment
-    segment->copy_0 = (void *) malloc(segment->num_words * segment->word_size);
+    int copy_size = segment->num_words * segment->word_size;
+
+    // alloc words in segment
+    segment->copy_0 = (void *) malloc(copy_size);
     if(unlikely(!segment->copy_0)) {
         return false;
     }
-    segment->copy_1 = (void *) malloc(segment->num_words * segment->word_size);
+    segment->copy_1 = (void *) malloc(copy_size);
     if(unlikely(!segment->copy_1)) {
         free(segment->copy_0);
         return false;
     }
+
+    // initialize words in segment with all zeros
+    memset(segment->copy_0, 0, copy_size);
+    memset(segment->copy_1, 0, copy_size);
+
 
     // init supporting data structure for words
     segment->read_only_copy = (int *) malloc(segment->num_words * sizeof(int));
@@ -257,6 +269,36 @@ bool segment_init(segment_t *segment, size_t size, size_t align_alloc)
     }
 }
 
+/** Encode segment number into an opaque pointer address
+ * @param segment_num number of segment
+ * @return address
+**/
+void *encode_segment_address(int segment_num)
+{
+    // address is NUM_SEGMENT << 24 + offset word
+    // << means shift left
+    intptr_t addr = segment_num << SEGMENT_SHIFT;
+    return (void *)addr;
+}
+
+/** Decode opaque pointer into segment and word number
+ * @param addr opaque pointer
+ * @param num_segment pointer to segment number
+ * @param num_word pointer to word number
+ * @return address
+**/
+void decode_segment_address(void *addr, int *num_segment, int *num_word)
+{
+    intptr_t num_s, num_w;
+
+    // calculate word and segment number
+    num_s = (int) addr >> SEGMENT_SHIFT;
+    intptr_t difference = num_s << SEGMENT_SHIFT;
+    num_w = addr - difference;
+
+    *num_segment = num_s;
+    *num_word = num_w;
+}
 
 
 
@@ -275,12 +317,14 @@ static const tx_t read_write_tx = UINTPTR_MAX - 11;
 **/
 typedef struct region_s {
     batcher_t *batcher;
-    void *start;
+    void *start; // TODO: maybe not used
     //struct link allocs;
     segment_t *segment;
     size_t size;
     size_t align;
     size_t align_alloc;
+    int region_id;
+    _Atomic(int) current_segment_index;
 } region_t;
 
 /** segment structure (multiple per shared memory)
@@ -351,16 +395,31 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused))
     region->size = size;
     region->align = align;
     region->align_alloc = align_alloc;
-
+    region->current_segment_index = 1;
     return region;
 }
 
 /** Destroy (i.e. clean-up + free) a given shared memory region.
  * @param shared Shared memory region to destroy, with no running transaction
 **/
-void tm_destroy(shared_t shared as(unused))
+void tm_destroy(shared_t shared)
 {
-    // TODO: tm_destroy(shared_t)
+    region_t *region = (region_t *) shared;
+
+    // free batcher
+    free(region->batcher);
+
+    // free segment
+    for (int i = 0; i < segment.len(); i++) {
+        segment_t *seg = region->segment[i];
+        free(seg->copy_0);
+        free(seg->copy_1);
+        free(seg->read_only_copy);
+        free(seg->write_tx);
+        free(seg->is_written_in_epoch);
+    }
+
+    free(region->segment);
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -370,11 +429,11 @@ void tm_destroy(shared_t shared as(unused))
 void *tm_start(shared_t shared)
 {
     // error check
-    if(((region_t *) shared)->start == NULL) {
-        fprintf(stderr, "ERROR (tm_start): start address NULL\n");
-        exit(0);
-    }
-    return ((region_t*) shared)->start;
+    region_t *region = (region_t *) shared;
+
+    // construct address of 1st shared memory segment
+    void *address = encode_segment_address(0);
+    return address;
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
@@ -453,9 +512,11 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-alloc_t tm_alloc(shared_t shared as(unused), tx_t tx as(unused), size_t size as(unused), void **target as(unused))
+alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
 {
-    // TODO: tm_alloc(shared_t, tx_t, size_t, void**)
+
+
+    // check length of size (multiple of alignment)
     return abort_alloc;
 }
 
