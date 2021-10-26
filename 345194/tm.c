@@ -36,6 +36,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <malloc.h>
 
 // Internal headers
 #include <tm.h>
@@ -249,6 +250,7 @@ bool segment_init(segment_t *segment, tx_t tx, size_t size, size_t align_alloc)
     segment->num_words = size / (align_alloc * 2); // each word is duplicated
     segment->word_size = align_alloc;
     segment->created_by_tx = tx;
+    segment->to_delete = 0;
 
     int copy_size = segment->num_words * segment->word_size;
 
@@ -362,9 +364,11 @@ typedef struct region_s {
  * @param copy_0 Copy 0 of segments words (accessed shifting a pointer)
  * @param copy_1 Copy 1 of segments words (accessed shifting a pointer)
  * @param read_only_copy Array of flags to distinguish read-only copy
- * @param write_tx array of first transaction which perform a write on 1 of the 2 words. From that moment, only he can write
+ * @param write_tx Array of first transaction which perform a write on 1 of the 2 words. From that moment, only he can write
  * @param is_written_in_epoch Array of boolean to flag if the word has been written
  * @param word_size Size of the word
+ * @param created_by_tx If -1 segment is shared, else it's temporary and must be deleted if tx abort
+ * @param to_delete If set to some tx, the segment has to be deleted when the last transaction exit the batcher, rollback set to 0 if the tx rollback
 **/
 typedef struct segment_s {
     size_t num_words;
@@ -374,7 +378,8 @@ typedef struct segment_s {
     tx_t *write_tx;
     bool *is_written_in_epoch;
     int word_size;
-    tx_t created_by_tx; // if -1 segment is shared, else it's temporary and must be deleted if tx abort
+    tx_t created_by_tx;
+    _Atomic(tx_t) to_delete;
 } segment_t;
 
 /** transaction structure (multiple per batcher)
@@ -576,9 +581,36 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused))
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const *source as(unused), size_t size as(unused), void *target as(unused))
+bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
-    // TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
+    region_t *region = (region_t *) shared;
+    int segment_index;
+    int word_index;
+
+    // check size, must be multiple of the shared memory region’s alignment, otherwise the behavior is undefined.
+    if (size <= 0 || size % region->align != 0) {
+        fprint("tm_read: incorrect size\n");
+        return abort_alloc;
+    }
+
+    // retrieve segment and word number
+    decode_segment_address(source, &segment_index, &word_index);
+    
+    // check address correctness
+    if(segment_index < 0 || word_index < 0) {
+        fprint("tm_read: incorrect indexes\n");
+        return abort_alloc;
+    }
+
+    // check that source and target addresses are a positive multiple of the shared memory region’s alignment, otherwise the behavior is undefined.
+    // TODO
+
+    // check size source and target, must be at least size, otherwise the behavior is undefined.
+    // TODO check also source buffer size????? don't know
+    if (malloc_usable_size(target) < size) {
+        fprint("tm_read: incorrect buffer size\n");
+        return abort_alloc;
+    }
 
     // COMMENT: to read the segment at index i (passed), use index a = min(i, len(segments))
     // and if in a not present segment with id = i, decrease a and repeat
@@ -666,10 +698,35 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
  * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
 **/
-bool tm_free(shared_t shared as(unused), tx_t tx as(unused), void *target as(unused))
+bool tm_free(shared_t shared, tx_t tx, void *target)
 {
-    // TODO: tm_free(shared_t, tx_t, void*)
-    return false;
+    int segment_index;
+    int word_index;
+    int cmp_val = 0;
+    region_t *region = (region_t *) shared;
+
+    // retrieve segment and word number
+    decode_segment_address(target, &segment_index, &word_index);
+    
+    // check address correctness (can't free 1st segment if have an address which is not pointing to the 1st word)
+    if(segment_index == 0 || word_index != 0) {
+        fprint("tm_free: incorrect indexes\n");
+        return false;
+    }
+
+    // free (set to tx to_delete) segment from array of segments
+    atomic_compare_exchange_strong(&((int)region->segment[segment_index].to_delete), &cmp_val, tx); // 0 should be a pointer to a value
+
+    // abort concurrent transactions (or sequentials) which called free on segment after some other transaction
+    if(region->segment[segment_index].to_delete != tx) {
+        fprint("tm_free: tx has already been freed\n");
+        return false; // abort
+    }
+
+    // add freed segment index to array of freed segment indexes (NO, TODO: do during commit when the last transaction exit the batcher)
+    // TODO: if a transaction abort, it has to set all to_delete to 0 (for their tx value)
+
+    return true;
 }
 
 
