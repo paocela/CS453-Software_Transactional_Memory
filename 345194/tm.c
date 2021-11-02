@@ -179,7 +179,7 @@ bool batcher_init(batcher_t *batcher)
     }
 
     batcher->running_tx = NULL;
-    batcher->num_active_tx = 0; // default is 0
+    batcher->num_running_tx = 0; // default is 0
     return true;
 }
 
@@ -221,7 +221,7 @@ void leave(batcher_t *batcher)
         
         // init transactions array with new number of transactions
         if(batcher->running_tx == NULL) {
-            batcher->running_tx = (transaction_t *) malloc(batcher->remaining * (transaction_t));
+            batcher->running_tx = (transaction_t *) malloc(batcher->remaining * sizeof(transaction_t));
         } else {
             batcher->running_tx = (transaction_t *) realloc(batcher->running_tx, batcher->remaining);   
         }
@@ -271,14 +271,14 @@ bool segment_init(segment_t *segment, tx_t tx, size_t size, size_t align_alloc)
 
 
     // init supporting data structure for words
-    segment->read_only_copy = (int *) malloc(segment->num_words * sizeof(int));
+    segment->read_only_copy = (int *) calloc(segment->num_words, sizeof(int));
     if(unlikely(!segment->read_only_copy)) {
         free(segment->copy_0);
         free(segment->copy_1);
         return false;
     }
-    segment->write_tx = (tx_t *) malloc(segment->num_words * sizeof(tx_t));
-    if(unlikely(!segment->write_tx)) {
+    segment->access_set = (tx_t *) malloc(segment->num_words * sizeof(tx_t));
+    if(unlikely(!segment->access_set)) {
         free(segment->copy_0);
         free(segment->copy_1);
         free(segment->read_only_copy);
@@ -289,8 +289,28 @@ bool segment_init(segment_t *segment, tx_t tx, size_t size, size_t align_alloc)
         free(segment->copy_0);
         free(segment->copy_1);
         free(segment->read_only_copy);
-        free(segment->write_tx);
+        free(segment->access_set);
         return false;
+    }
+    segment->word_locks = (bool *) malloc(segment->num_words * sizeof(lock_t));
+    if(unlikely(!segment->is_written_in_epoch)) {
+        free(segment->is_written_in_epoch);
+        free(segment->copy_0);
+        free(segment->copy_1);
+        free(segment->read_only_copy);
+        free(segment->access_set);
+        return false;
+    }
+    for(int i = 0; i < segment->num_words; i++) {
+        if(unlikely(!lock_init(&(segment->word_locks[i])))) {
+            free(segment->word_locks);
+            free(segment->is_written_in_epoch);
+            free(segment->copy_0);
+            free(segment->copy_1);
+            free(segment->read_only_copy);
+            free(segment->access_set);
+            return false;
+        }
     }
 }
 
@@ -364,8 +384,8 @@ typedef struct region_s {
  * @param copy_0 Copy 0 of segments words (accessed shifting a pointer)
  * @param copy_1 Copy 1 of segments words (accessed shifting a pointer)
  * @param read_only_copy Array of flags to distinguish read-only copy
- * @param write_tx Array of first transaction which perform a write on 1 of the 2 words. From that moment, only he can write
  * @param is_written_in_epoch Array of boolean to flag if the word has been written
+ * @param access_set Array of read-write tx which have accessed the word (the first to access the word(read or write) will own it for the epoch)
  * @param word_size Size of the word
  * @param created_by_tx If -1 segment is shared, else it's temporary and must be deleted if tx abort
  * @param to_delete If set to some tx, the segment has to be deleted when the last transaction exit the batcher, rollback set to 0 if the tx rollback
@@ -374,23 +394,14 @@ typedef struct segment_s {
     size_t num_words;
     void *copy_0;
     void *copy_1;
-    int *read_only_copy;
-    tx_t *write_tx;
+    int *read_only_copy; // all read it, except last tx who writes
+    tx_t *access_set;
     bool *is_written_in_epoch;
+    lock_t *word_locks;
     int word_size;
     tx_t created_by_tx;
     _Atomic(tx_t) to_delete;
 } segment_t;
-
-/** transaction structure (multiple per batcher)
- * @param num_words Number of words in segment (TODO actully could be a global constant? maybe)
- * @param copy_0 Copy 0 of segments words (accessed shifting a pointer)
- * @param copy_1 Copy 1 of segments words (accessed shifting a pointer)
- * @param read_only_copy Array of flags to distinguish read-only copy
- * @param write_tx array of first transaction which perform a write on 1 of the 2 words. From that moment, only he can write
- * @param is_written_in_epoch Array of boolean to flag if the word has been written
- * @param word_size Size of the word
-**/
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
@@ -488,12 +499,12 @@ void tm_destroy(shared_t shared)
     free(region->batcher);
 
     // free segment
-    for (int i = 0; i < region->segment.len(); i++) {
+    for (int i = 0; i < sizeof(region->segment) / sizeof(segment_t); i++) {
         segment_t seg = region->segment[i];
         free(seg.copy_0);
         free(seg.copy_1);
         free(seg.read_only_copy);
-        free(seg.write_tx);
+        free(seg.access_set);
         free(seg.is_written_in_epoch);
     }
 
@@ -584,13 +595,20 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused))
 bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
     region_t *region = (region_t *) shared;
+    segment_t *segment;
     int segment_index;
     int word_index;
+    int num_words_to_read;
+    alloc_t result;
+    int offset;
+    bool is_ro;
+
+    /**SANITY CHECKS**/
 
     // check size, must be multiple of the shared memory region’s alignment, otherwise the behavior is undefined.
-    if (size <= 0 || size % region->align != 0) {
+    if (size <= 0 || size % region->align_alloc != 0) {
         fprint("tm_read: incorrect size\n");
-        return abort_alloc;
+        return false;
     }
 
     // retrieve segment and word number
@@ -599,22 +617,105 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
     // check address correctness
     if(segment_index < 0 || word_index < 0) {
         fprint("tm_read: incorrect indexes\n");
-        return abort_alloc;
+        return false;
     }
 
     // check that source and target addresses are a positive multiple of the shared memory region’s alignment, otherwise the behavior is undefined.
-    // TODO
-
-    // check size source and target, must be at least size, otherwise the behavior is undefined.
-    // TODO check also source buffer size????? don't know
-    if (malloc_usable_size(target) < size) {
-        fprint("tm_read: incorrect buffer size\n");
-        return abort_alloc;
+    if(word_index % region->align_alloc != 0 || (uintptr_t)target % region->align_alloc != 0) {
+        fprint("tm_read: incorrect target or source buffer alignment\n");
+        return false;
     }
 
-    // COMMENT: to read the segment at index i (passed), use index a = min(i, len(segments))
-    // and if in a not present segment with id = i, decrease a and repeat
-    return false;
+    // check size source and target, must be at least size, otherwise the behavior is undefined.
+    if (malloc_usable_size(target) < size) {
+        fprint("tm_read: incorrect target buffer size\n");
+        return false;
+    }
+    if(malloc_usable_size(region->segment[segment_index].copy_0) < size) {
+        fprint("tm_read: incorrect source buffer size\n");
+        return false;
+    }
+
+    /**READ OPERATION**/
+
+    // calculate number of words to be read in segment
+    num_words_to_read = size / region->align_alloc;
+
+    // get segment
+    segment = &region->segment[segment_index];
+
+    // get transaction type
+    is_ro = region->batcher->running_tx[tx].is_ro;
+
+    // loop thorugh all word indexes (starting from the passed one)
+    for (int curr_word_index = word_index; curr_word_index < word_index + num_words_to_read; curr_word_index++) {
+        offset = (curr_word_index - word_index) * segment->word_size;
+        result = read_word(curr_word_index, target + (offset), segment, is_ro, tx);
+        if(result == abort_alloc) {
+            return false;
+        }
+    }
+    return true;
+}
+
+alloc_t read_word(int word_index, void *target, segment_t *segment, bool is_ro, tx_t tx)
+{
+    int readable_copy;
+
+    // if read-only
+    if(is_ro == true) {
+        // find readable copy
+        readable_copy = segment->read_only_copy[word_index];
+
+        // perform read operation into target
+        if(readable_copy == 0) {
+            memcpy(target, segment->copy_0 + word_index, segment->word_size);
+        } else {
+            memcpy(target, segment->copy_1 + word_index, segment->word_size);
+        }
+        return success_alloc;
+    } else {
+        // if read-write
+
+        // acquire word lock
+        lock_acquire(&segment->word_locks[word_index]);
+
+        // if word written in current epoch
+        if(segment->is_written_in_epoch[word_index] == true) {
+
+            // release word lock
+            lock_release(&segment->word_locks[word_index]);
+
+            // if transaction in access set
+            if(segment->access_set[word_index] == tx) {
+                // read write copy into target
+                if(readable_copy == 0) {
+                    memcpy(target, segment->copy_1 + word_index, segment->word_size);
+                } else {
+                    memcpy(target, segment->copy_0 + word_index, segment->word_size);
+                }
+
+                return success_alloc;
+            } else {
+                return abort_alloc;
+            }
+        } else {
+            // read read copy into target
+            if(readable_copy == 0) {
+            memcpy(target, segment->copy_0 + word_index, segment->word_size);
+            } else {
+                memcpy(target, segment->copy_1 + word_index, segment->word_size);
+            }
+
+            // add tx into access set
+            segment->access_set[word_index] = tx;
+
+            // release word lock
+            lock_release(&segment->word_locks[word_index]);
+
+            return success_alloc;
+        }
+    }
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -625,10 +726,119 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source as(unused), size_t size as(unused), void *target as(unused))
+bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
-    // TODO: tm_write(shared_t, tx_t, void const*, size_t, void*)
-    return false;
+    region_t *region = (region_t *) shared;
+    segment_t *segment;
+    int segment_index;
+    int word_index;
+    int num_words_to_read;
+    alloc_t result;
+    int offset;
+
+    /**SANITY CHECKS**/
+
+    // check size, must be multiple of the shared memory region’s alignment, otherwise the behavior is undefined.
+    if (size <= 0 || size % region->align_alloc != 0) {
+        fprint("tm_read: incorrect size\n");
+        return false;
+    }
+
+    // retrieve segment and word number
+    decode_segment_address(source, &segment_index, &word_index);
+    
+    // check address correctness
+    if(segment_index < 0 || word_index < 0) {
+        fprint("tm_read: incorrect indexes\n");
+        return false;
+    }
+
+    // check that source and target addresses are a positive multiple of the shared memory region’s alignment, otherwise the behavior is undefined.
+    if(word_index % region->align_alloc != 0 || (uintptr_t)target % region->align_alloc != 0) {
+        fprint("tm_read: incorrect target or source buffer alignment\n");
+        return false;
+    }
+
+    // check size source and target, must be at least size, otherwise the behavior is undefined.
+    if (malloc_usable_size(target) < size) {
+        fprint("tm_read: incorrect target buffer size\n");
+        return false;
+    }
+    if(malloc_usable_size(region->segment[segment_index].copy_0) < size) {
+        fprint("tm_read: incorrect source buffer size\n");
+        return false;
+    }
+
+    /**WRITE OPERATION**/
+
+    // calculate number of words to be read in segment
+    num_words_to_read = size / region->align_alloc;
+
+    // get segment
+    segment = &region->segment[segment_index];
+
+    // loop thorugh all word indexes (starting from the passed one)
+    for (int curr_word_index = word_index; curr_word_index < word_index + num_words_to_read; curr_word_index++) {
+        offset = (curr_word_index - word_index) * segment->word_size;
+        result = write_word(curr_word_index, source + (offset), segment, tx);
+        if(result == abort_alloc) {
+            return false;
+        }
+    }
+    return true;
+}
+
+alloc_t write_word(int word_index, void *source, segment_t *segment, tx_t tx)
+{
+    int readable_copy;
+
+    readable_copy = segment->read_only_copy[word_index];
+
+    // acquire word lock
+    lock_acquire(&segment->word_locks[word_index]);
+
+    // if word has been written before
+    if(segment->is_written_in_epoch[word_index] == true) {
+        // release word lock
+        lock_release(&segment->word_locks[word_index]);
+
+        // if tx in the access set
+        if (segment->access_set[word_index] == tx) {
+            // write source into write copy
+            if(readable_copy == 0) {
+                memcpy(segment->copy_1 + word_index, source, segment->word_size);
+            } else {
+                memcpy(segment->copy_0 + word_index, source, segment->word_size);
+            }
+
+            return success_alloc;
+        } else {
+            return abort_alloc;
+        }
+    } else {
+        // if one other tx in access set
+        if(segment->access_set[word_index] != 0) {
+            return abort_alloc;
+        } else {
+            // write source into write copy
+            if(readable_copy == 0) {
+                memcpy(segment->copy_1 + word_index, source, segment->word_size);
+            } else {
+                memcpy(segment->copy_0 + word_index, source, segment->word_size);
+            }
+
+            // add tx into access set
+            segment->access_set[word_index] = tx;
+
+            // mark word as it has been written
+            segment->is_written_in_epoch[word_index] = true;
+
+            lock_release(&segment->word_locks[word_index]);
+
+            return success_alloc;
+        }
+    }
+
 }
 
 /** [thread-safe] Memory allocation in the given transaction.
@@ -646,7 +856,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     int index = -1;
 
     // check correct alignment of size
-    if (size <= 0 || size % region->align != 0) {
+    if (size <= 0 || size % region->align_alloc != 0) {
         fprint("tm_alloc: incorrect size\n");
         return abort_alloc;
     }
