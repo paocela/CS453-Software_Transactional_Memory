@@ -981,7 +981,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     for (int i = 0; i < sizeof(region->freed_segment_index) / sizeof(int); i++) {
         if(region->freed_segment_index[i] != -1) {
             index = region->freed_segment_index[i];
-            region->freed_segment_index[i] == -1;
+            region->freed_segment_index[i] = -1;
         }
     }
     lock_release(&region->freed_segment_index_lock);
@@ -1012,7 +1012,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     region->segment[index] = segment;
 
     // return encoded address to segment
-    target = encode_segment_address(index);
+    *target = encode_segment_address(index);
 
     return success_alloc;
 }
@@ -1033,7 +1033,7 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
     // retrieve segment and word number
     decode_segment_address(target, &segment_index, &word_index);
     
-    // check address correctness (can't free 1st segment if have an address which is not pointing to the 1st word)
+    // check address correctness (can't free 1st segment or an address which is not pointing to the 1st word)
     if(segment_index == 0 || word_index != 0) {
         fprint("tm_free: incorrect indexes\n");
         abort(region, tx);
@@ -1063,14 +1063,20 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
 void abort(region_t *region, tx_t tx)
 {
     int invalid_value = 0;
+    int max_segment_index;
+
+    // store current max segment index
+    max_segment_index = region->current_segment_index;
+
     // for all segments
-    for (int segment_index = 0; segment_index < region->current_segment_index; segment_index++) {
+    for (int segment_index = 0; segment_index < max_segment_index && region->freed_segment_index[segment_index] == -1; segment_index++) {
         // unset segments on which tx has called tm_free previously
         atomic_compare_exchange_strong(&((int)region->segment[segment_index].to_delete), tx, invalid_value); // tx should be a pointer to a value
 
         // add used segment indexes for tx to freed_segment_index array (for tm_alloc)
         if (region->segment[segment_index].created_by_tx == tx) {
-            region->freed_segment_index[segment_index] = 1;
+            region->freed_segment_index[segment_index] = segment_index;
+            region->segment[segment_index].created_by_tx = 0;
         }
 
         // roolback write operations on each word performed by tx
@@ -1101,7 +1107,7 @@ void commit(region_t *region)
     for (int segment_index = 0; segment_index < region->current_segment_index && region->freed_segment_index[segment_index] == -1; segment_index++) {
         // add to freed_segment_index array segments which have been freed by tx
         if (region->segment[segment_index].to_delete != 0) {
-            region->freed_segment_index[segment_index] == 1; // so freed
+            region->freed_segment_index[segment_index] == segment_index; // so freed
         }
 
         // add used segment indexes for tx to freed_segment_index array
@@ -1112,11 +1118,10 @@ void commit(region_t *region)
         // commit algorithm for words (copy written word copy into read-only copy)
         for (int word_index = 0; word_index < region->segment[segment_index].num_words; word_index++) {
             if(region->segment[segment_index].access_set[word_index] != 0) {
-                region->segment[segment_index].access_set[word_index] = 0;
-
                 // swap valid copy (in case it has been written)
                 region->segment[segment_index].read_only_copy[word_index] == 0 ? 1: 0;
 
+                // empty access set
                 region->segment[segment_index].access_set[word_index] = 0;
             }
         }
