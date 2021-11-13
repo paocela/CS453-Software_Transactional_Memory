@@ -27,12 +27,14 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <limits.h>
 
 // -------------------------------------------------------------------------- //
 
 /** Global constants **/
 #define SEGMENT_SHIFT 24
 #define INIT_FREED_SEG_SIZE 1 // better if it grows together with the segment array
+#define INVALID_TX UINT_MAX
 
 // -------------------------------------------------------------------------- //
 
@@ -136,12 +138,12 @@ static bool lock_acquire(lock_t*);
 static void lock_release(lock_t*);
 
 void abort_tx(region_t *, tx_t);
-void commit_tx(region_t *);
+void commit_tx(region_t *, tx_t);
 
 bool batcher_init(batcher_t *);
 int get_epoch(batcher_t *);
 void enter(batcher_t *);
-void leave(batcher_t *, region_t *);
+void leave(batcher_t *, region_t *, tx_t tx);
 void batcher_cleanup(batcher_t *);
 
 bool segment_init(segment_t *, tx_t , size_t, size_t);
