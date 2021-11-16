@@ -201,12 +201,23 @@ void leave(batcher_t *batcher, region_t *region, tx_t tx)
 {
     lock_acquire(&batcher->lock);
     batcher->remaining--;
+    if(PRINT_DEBUG == 1) {
+        printf("<<leave>> (tx = %ld): start\n", tx);
+    }
     if(batcher->remaining == 0) {
         batcher->counter++;
         batcher->remaining = batcher->blocked_count;
         
         // realloc transactions array with new number of transactions
-        batcher->running_tx = (transaction_t *) realloc(batcher->running_tx, batcher->remaining);   
+        if (batcher->remaining == 0) {
+            free(batcher->running_tx);
+        } else {
+            if(PRINT_DEBUG == 1) {
+                printf("DEBUG REALLOC + size = %d\n", batcher->remaining);    
+            }
+
+            batcher->running_tx = (transaction_t *) realloc(batcher->running_tx, batcher->remaining * sizeof(transaction_t));
+        }
         batcher->num_running_tx = batcher->remaining;
         
         // TODO perform commit HERE (before starting the next batcher)
@@ -214,7 +225,9 @@ void leave(batcher_t *batcher, region_t *region, tx_t tx)
 
         batcher->blocked_count = 0;
 
-        printf("-------STARTING EPOCH %d (num tx = %d)-------\n", get_epoch(batcher), batcher->remaining);
+        if(PRINT_DEBUG == 0) {
+            printf("-------STARTING EPOCH %d (num tx = %d)-------\n", get_epoch(batcher), batcher->remaining);
+        }
 
         pthread_cond_broadcast(&batcher->cond_var);
     } else {
@@ -222,6 +235,7 @@ void leave(batcher_t *batcher, region_t *region, tx_t tx)
         // - set alloc segment to persistent
         // - set modified words to done (maybe)
     }
+
     lock_release(&batcher->lock);
     return;
 }
@@ -829,8 +843,8 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     int offset;
     void *my_source = source; // not const
 
-    if(PRINT_DEBUG == 1) {
-        printf("<<tm_write>> (tx = %ld): start\n", tx);
+    if(PRINT_DEBUG == 0) {
+        printf("<<tm_write>> (tx = %ld): start\n", tx, size);
     }
 
     /**SANITY CHECKS**/
@@ -893,12 +907,12 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         result = write_word(curr_word_index, my_source + (offset), segment, tx);
         if(result == abort_alloc) {
             abort_tx(region, tx);
-            printf("tm_write (tx = %ld): abort writing (index = %d)\n", tx, curr_word_index);
+            //printf("tm_write (tx = %ld): abort writing (index = %d)\n", tx, curr_word_index);
             return false; // abort_tx
         }
     }
 
-    if(PRINT_DEBUG == 1) {
+    if(PRINT_DEBUG == 0) {
         printf("<<tm_write>> (tx = %ld): end\n", tx);
     }
     return true;
@@ -915,7 +929,7 @@ alloc_t write_word(int word_index, void *source, segment_t *segment, tx_t tx)
 {
     int readable_copy;
 
-    if(PRINT_DEBUG == 1) {
+    if(PRINT_DEBUG == 0) {
         printf("<<write_word>> (tx = %ld, word_index = %d): start\n", tx, word_index);
     }
 
@@ -940,17 +954,16 @@ alloc_t write_word(int word_index, void *source, segment_t *segment, tx_t tx)
 
             return success_alloc;
         } else {
-            printf("debug 1, word_index = %d\n", word_index);
             return abort_alloc;
         }
     } else {
         // if one other tx in access set
         if(segment->access_set[word_index] != INVALID_TX) {
             lock_release(&segment->word_locks[word_index]);
-            printf("debug 2\n");
             return abort_alloc;
         } else {
             // write source into write copy
+            
             if(readable_copy == 0) {
                 memcpy(segment->copy_1 + (word_index * segment->word_size), source, segment->word_size);
             } else {
@@ -971,7 +984,7 @@ alloc_t write_word(int word_index, void *source, segment_t *segment, tx_t tx)
 
 }
 
-/** [thread-safe] Memory allocation in the given transaction.
+/** [thread-safe] Memory allocation in the given transaction. (should be called a lot)
  * @param shared Shared memory region associated with the transaction
  * @param tx     Transaction to use
  * @param size   Allocation requested size (in bytes), must be a positive multiple of the alignment
@@ -984,7 +997,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     segment_t segment;
     int index = -1;
 
-    if(PRINT_DEBUG == 1) {
+    if(PRINT_DEBUG == 0) {
         printf("<<tm_alloc>> (tx = %ld): start\n", tx);
     }
     
@@ -1019,14 +1032,13 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
         lock_acquire(&(region->realloc_segment_lock));
 
         if(index >= (int) sizeof(region->segment) / (int) sizeof(region->segment[0])) {
-            region->segment = realloc(region->segment, 2 * sizeof(region->segment) / sizeof(region->segment[0]));
-            region->freed_segment_index = realloc(region->freed_segment_index, 2 * sizeof(region->freed_segment_index) / sizeof(region->freed_segment_index[0]));
-
-            if(region->segment == NULL) {
+            region->segment = realloc(region->segment, sizeof(segment_t) * 2 * sizeof(region->segment) / sizeof(region->segment[0]));
+            region->freed_segment_index = realloc(region->freed_segment_index, sizeof(segment_t) * 2 * sizeof(region->freed_segment_index) / sizeof(region->freed_segment_index[0]));
+            if(region->segment == NULL || region->freed_segment_index == NULL) {
                 // release realloc lock
                 lock_release(&(region->realloc_segment_lock));
 
-                fprintf(stderr, "tm_alloc: segment array realloc failed\n");
+                fprintf(stderr, "tm_alloc: segment or freed_segment_index array realloc failed\n");
 
                 return nomem_alloc;
             }
@@ -1042,7 +1054,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     // return encoded address to segment
     *target = encode_segment_address(index);
 
-    if(PRINT_DEBUG == 1) {
+    if(PRINT_DEBUG == 0) {
         printf("<<tm_alloc>> (tx = %ld): end\n", tx);
     }
 
@@ -1062,7 +1074,7 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
     unsigned long int cmp_val = INVALID_TX;
     region_t *region = (region_t *) shared;
 
-    if(PRINT_DEBUG == 1) {
+    if(PRINT_DEBUG == 0) {
         printf("<<tm_free>> (tx = %ld): start\n", tx);
     }
 
@@ -1089,7 +1101,7 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
     // add freed segment index to array of freed segment indexes (NO, TODO: do during commit when the last transaction exit the batcher)
     // TODO: if a transaction abort_tx, it has to set all to_delete to 0 (for their tx value)
 
-    if(PRINT_DEBUG == 1) {
+    if(PRINT_DEBUG == 0) {
         printf("<<tm_free>> (tx = %ld): end\n", tx);
     }
 
@@ -1105,6 +1117,7 @@ void abort_tx(region_t *region, tx_t tx)
     unsigned long int invalid_value = INVALID_TX;
     int max_segment_index;
     segment_t *segment;
+    tx_t tx_tmp;
 
     if(PRINT_DEBUG == 1) {
         printf("<<abort_tx>> (tx = %ld): start\n", tx);
@@ -1116,8 +1129,10 @@ void abort_tx(region_t *region, tx_t tx)
     // for all segments
     for (int segment_index = 0; segment_index < max_segment_index && region->freed_segment_index[segment_index] == -1; segment_index++) {
         segment = &region->segment[segment_index];
-        // unset segments on which tx has called tm_free previously
+        // unset segments on which tx has called tm_free previously (tmp is needed because of the atomic_compare_exchange, which perform if then else (check code at the bottom))
+        tx_tmp = tx;
         atomic_compare_exchange_strong(&segment->to_delete, &tx, invalid_value); // tx should be a pointer to a value
+        tx = tx_tmp;
 
         // add used segment indexes for tx to freed_segment_index array (for tm_alloc)
         if (segment->created_by_tx == tx) {
@@ -1142,7 +1157,7 @@ void abort_tx(region_t *region, tx_t tx)
     leave(region->batcher, region, tx);
 
     if(PRINT_DEBUG == 1) {
-        printf("<<abort_tx>> (tx = %ld): start\n", tx);
+        printf("<<abort_tx>> (tx = %ld): end\n", tx);
     }
 }
 
@@ -1154,7 +1169,7 @@ void commit_tx(region_t *region, tx_t tx)
 {
     segment_t *segment;
 
-    if(PRINT_DEBUG == 0) {
+    if(PRINT_DEBUG == 1) {
         printf("<<commit_tx>> (tx = %ld): start\n", tx);
     }
     
@@ -1183,13 +1198,10 @@ void commit_tx(region_t *region, tx_t tx)
 
                 // empty is_written_in_epoch flag
                 segment->is_written_in_epoch[word_index] = false;
-                if(word_index == 0) {
-                    printf("HERE 1\n");
-                }
             }
         }
     }
-    if(PRINT_DEBUG == 0) {
+    if(PRINT_DEBUG == 1) {
         printf("<<commit_tx>> (tx = %ld): end\n", tx);
     }
 }
@@ -1197,3 +1209,26 @@ void commit_tx(region_t *region, tx_t tx)
 // TODO the problem now is that it seems like modification to variables in a segment don't propagare
 // so they are not really applied into memory (something to do with pointers)
 // as you can see in epoch 0 it set to false for word_index = 0, but in epoch 1 it's still true
+
+
+// atomic_compare_exchange_strong explanation
+/**
+ * atomic_compare_exchange_strong(obj, expected, desired) {
+ *  if(obj == expected) {
+ *      obj = desired;
+ *  } else {
+ *      expected = obj;
+ *  }
+ * }
+ */
+/**
+ * our_function(to_delete, tx, invalid_value) {
+ *  if(to_delete = tx) {
+ *      to_delete = invalid_value;
+ *  } else {
+ *      to_delete = to_delete;
+ *      // what it does
+ *      tx = to_delete
+ *  }
+ * }
+ */
