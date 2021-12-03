@@ -33,7 +33,8 @@
 
 /** Global constants **/
 #define SEGMENT_SHIFT 24
-#define INIT_FREED_SEG_SIZE 1 // better if it grows together with the segment array
+#define INIT_FREED_SEG_SIZE 10 // better if it grows together with the segment array
+#define INIT_SEG_SIZE 10 // set to 1 if you want reallocation of segments (not statically init)
 #define INVALID_TX UINT_MAX
 
 // -------------------------------------------------------------------------- //
@@ -73,6 +74,7 @@ typedef struct batcher_s {
     int blocked_count;
     transaction_t *running_tx;
     int num_running_tx;
+    bool no_read_write_tx;
 } batcher_t;
 
 /** segment structure (multiple per shared memory).
@@ -147,6 +149,7 @@ void leave(batcher_t *, region_t *, tx_t tx);
 void batcher_cleanup(batcher_t *);
 
 bool segment_init(segment_t *, tx_t , size_t, size_t);
+bool soft_segment_init(segment_t *, tx_t, size_t, size_t);
 void *encode_segment_address(int);
 void decode_segment_address(void const *, int *, int *);
 
