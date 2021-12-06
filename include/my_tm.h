@@ -1,6 +1,6 @@
 /**
- * @file   tm.h
- * @author Sébastien ROUAULT <sebastien.rouault@epfl.ch>
+ * @file   my_tm.h
+ * @author Paolo Celada <paolo.celada@epfl.ch>
  *
  * @section LICENSE
  *
@@ -18,8 +18,7 @@
  *
  * @section DESCRIPTION
  *
- * Interface declaration for the transaction manager to use (C version).
- * YOU SHOULD NOT MODIFY THIS FILE.
+ * Additional functions, structures and constants
 **/
 
 #pragma once
@@ -49,21 +48,12 @@ typedef struct lock_s {
 } lock_t;
 
 /** Transaction characteristics.
- * @param tx_id Transaction id
- * @param is_ro Boolean flag for transaction type
-**/
-typedef struct transaction_s {
-    tx_t tx_id;
-    bool is_ro;
-} transaction_t;
-
-/** Transaction characteristics.
  * @param counter Epoch counter
  * @param remaining Reaming transactions in batcher of current epoch
  * @param lock Lock for remaining counter
  * @param cond_var Conditional variable to control batcher
  * @param blocked_count Number of blocked transactions waiting for the next epoch
- * @param running_tx Array of currently running transactions in epoch
+ * @param is_ro Array of bool to save if tx at certain index is read-only
  * @param num_running_tx Number of currently running transactions in epoch
 **/
 typedef struct batcher_s {
@@ -72,7 +62,7 @@ typedef struct batcher_s {
     lock_t lock;
     pthread_cond_t cond_var;
     int blocked_count;
-    transaction_t *running_tx;
+    bool *is_ro;
     int num_running_tx;
     bool no_read_write_tx;
 } batcher_t;
@@ -115,7 +105,7 @@ typedef struct segment_s {
  * @param curren_transaction_id Max value of transaction id assigned to some tx
 **/
 typedef struct region_s {
-    batcher_t *batcher;
+    batcher_t batcher;
     void *start;
     //struct link allocs;
     segment_t *segment;
@@ -154,4 +144,4 @@ void *encode_segment_address(int);
 void decode_segment_address(void const *, int *, int *);
 
 alloc_t read_word(int, void *, segment_t *, bool, tx_t);
-alloc_t write_word(int, void *, segment_t *, tx_t);
+alloc_t write_word(int, const void *, segment_t *, tx_t);
