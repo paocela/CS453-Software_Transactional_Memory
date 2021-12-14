@@ -1,4 +1,4 @@
-# CS-453 - Course project
+# CS-453 - Dual-versioned Software Transactional Memory
 
 The [project description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf) is available on [Moodle](https://moodle.epfl.ch/course/view.php?id=14334) and the [website of the course](https://dcl.epfl.ch/site/education/ca_2021).
 
@@ -14,6 +14,7 @@ The description includes:
   * rules for (optionally) using 3rd-party libraries and collaboration (although the project is _individual_)
 
 This repository provides:
+* the actual STM library written in C11 (in `345194/`)
 * a reference implementation (in `reference/`)
 * a "skeleton" implementation (in `template/`)
   * this template is written in C11
