@@ -55,6 +55,7 @@ typedef struct lock_s {
  * @param blocked_count Number of blocked transactions waiting for the next epoch
  * @param is_ro Array of bool to save if tx at certain index is read-only
  * @param num_running_tx Number of currently running transactions in epoch
+ * @param no_read_write_tx bool to check if no read-write operation have been performed during epoch (for commit optimization)
 **/
 typedef struct batcher_s {
     int counter;
@@ -77,6 +78,9 @@ typedef struct batcher_s {
  * @param word_size Size of the word
  * @param created_by_tx If -1 segment is shared, else it's temporary and must be deleted if tx abort
  * @param to_delete If set to some tx, the segment has to be deleted when the last transaction exit the batcher, rollback set to 0 if the tx rollback
+ * @param has_been_modified Flag to track if segment has been modified in epoch
+ * @param index_modified_words Array to store sequential indexes of accessed words in segment
+ * @param cnt_index_modified_words Atomic counter incremented every time there is an operation on word 
 **/
 typedef struct segment_s {
     size_t num_words;
@@ -89,6 +93,9 @@ typedef struct segment_s {
     int word_size;
     tx_t created_by_tx; // in tm_alloc
     _Atomic(tx_t) to_delete; // in tm_free
+    bool has_been_modified;
+    int *index_modified_words;
+    _Atomic(int) cnt_index_modified_words;
 } segment_t;
 
 /** shared memory region structure (1 per shared memory).

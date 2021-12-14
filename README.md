@@ -1,4 +1,4 @@
-# CS-453 - Dual-versioned Software Transactional Memory
+# CS-453 - Dual-Versioned Software Transactional Memory
 
 The [project description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf) is available on [Moodle](https://moodle.epfl.ch/course/view.php?id=14334) and the [website of the course](https://dcl.epfl.ch/site/education/ca_2021).
 
