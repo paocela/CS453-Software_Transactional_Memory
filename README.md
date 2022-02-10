@@ -1,5 +1,6 @@
 # CS-453 - Dual-Versioned Software Transactional Memory
 
+## Content
 The [project description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf) is available on [Moodle](https://moodle.epfl.ch/course/view.php?id=14334) and the [website of the course](https://dcl.epfl.ch/site/education/ca_2021).
 
 The description includes:
@@ -13,6 +14,7 @@ The description includes:
   * how your submission will be graded
   * rules for (optionally) using 3rd-party libraries and collaboration (although the project is _individual_)
 
+## Practical Details
 This repository provides:
 * the actual STM library written in C11 (in `345194/`)
 * a reference implementation (in `reference/`)
@@ -25,3 +27,6 @@ This repository provides:
 * a tool to submit your implementation (in `submit.py`)
   * you should have received by mail a secret _unique user identifier_ (UUID)
   * see the [description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf) for more information
+
+## Results
+The final implementation, after optimization, reached speedup x1.2 above the reference version for the grading workload
